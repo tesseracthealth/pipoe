@@ -22,11 +22,13 @@ from pprint import pformat
 import pkginfo
 
 BB_TEMPLATE = """
-SUMMARY = "{summary}"
+DESCRIPTION = "{summary}"
 HOMEPAGE = "{homepage}"
 AUTHOR = "{author} <{author_email}>"
 LICENSE = "{license}"
 LIC_FILES_CHKSUM = "file://{license_file};md5={license_md5}"
+
+inherit setuptools{setuptools}
 
 SRC_URI = "{src_uri}"
 SRC_URI[md5sum] = "{md5}"
@@ -34,39 +36,43 @@ SRC_URI[sha256sum] = "{sha256}"
 
 S = "${{WORKDIR}}/{src_dir}"
 
-DEPENDS += " {build_dependencies}"
-RDEPENDS_${{PN}} = "{dependencies}"
+{build_dependencies}
+{dependencies}
 
-inherit setuptools{setuptools}
+BBCLASSEXTEND = "native nativesdk"
 """
 
 BB_TEMPLATE_PYPI = """
-SUMMARY = "{summary}"
+DESCRIPTION = "{summary}"
 HOMEPAGE = "{homepage}"
 AUTHOR = "{author} <{author_email}>"
 LICENSE = "{license}"
 LIC_FILES_CHKSUM = "file://{license_file};md5={license_md5}"
 
+inherit pypi setuptools{setuptools}
+
 SRC_URI[md5sum] = "{md5}"
 SRC_URI[sha256sum] = "{sha256}"
 
-PYPI_PACKAGE = "{pypi_package}"
+PYPI_PACKAGE = "{pypi_package}"{pypi_package_ext}
 
-DEPENDS += " {build_dependencies}"
-RDEPENDS_${{PN}} = "{dependencies}"
+{build_dependencies}
+{dependencies}
 
-inherit setuptools{setuptools} pypi
+BBCLASSEXTEND = "native nativesdk"
 """
 
 
 BB_EXTRA_TEMPLATE = """
-SUMMARY = "{summary}"
+DESCRIPTION = "{summary}"
 HOMEPAGE = "{homepage}"
 AUTHOR = "{author} <{author_email}>"
 
-RDEPENDS_${{PN}} = "{dependencies}"
+{dependencies}
 
 inherit packagegroup
+
+BBCLASSEXTEND = "native nativesdk"
 """
 
 
@@ -199,12 +205,13 @@ def get_package_file_info(package, version, uri):
             license_file = "setup.py"
 
         # Try to catch build depends into setup.py file
-        with open(os.path.join(tmpdir, src_dir, "setup.py"), 'r+') as f:
-            data = mmap.mmap(f.fileno(), 0)
-            match = re.search(b'^(\s*)setup_requires( *)=( *)([\[|\(]*)(.*)([\]|\)]*)', data, re.MULTILINE)
-            if match:
-                for bd in match.group(5).replace(b'[', b'').replace(b']', b'').replace(b'(', b'').replace(b')', b'').strip().split(b","):
-                     build_deps.extend(gather_package_build_depends(bd, data))
+        if os.path.exists(os.path.join(tmpdir, src_dir, "setup.py")):
+            with open(os.path.join(tmpdir, src_dir, "setup.py"), 'r+') as f:
+                data = mmap.mmap(f.fileno(), 0)
+                match = re.search(b'^(\s*)setup_requires( *)=( *)([\[|\(]*)(.*)([\]|\)]*)', data, re.MULTILINE)
+                if match:
+                    for bd in match.group(5).replace(b'[', b'').replace(b']', b'').replace(b'(', b'').replace(b')', b'').strip().split(b","):
+                         build_deps.extend(gather_package_build_depends(bd, data))
 
 
         license_path = os.path.join(tmpdir, src_dir, license_file)
@@ -253,6 +260,16 @@ def parse_requires_dist(requires_dist):
     ret = Dependency(spec[0], decide_version(spec), decide_extra(spec))
     return ret
 
+def pkg_size(pkg):
+    # whl is omitted as we prefer source package
+    extensions = ["tar", "tar.gz", "tar.bz2", "tar.xz"]
+    for extension in extensions:
+        if pkg["url"].endswith(extension):
+            return pkg["size"]
+    if pkg["url"].endswith("zip"):
+        return pkg["size"] * 10
+    return pkg["size"] * 10000
+
 
 def fetch_requirements_from_remote_package(info, version):
     """ Looks up requires_dist from an actual package """
@@ -261,7 +278,7 @@ def fetch_requirements_from_remote_package(info, version):
     pkg_versions = info["releases"][version]
 
     # If we must fetch a package, lets fetch the smallest one
-    pkg_url = sorted(pkg_versions, key=lambda pkg: pkg["size"], reverse=True)[0]["url"]
+    pkg_url = sorted(pkg_versions, key=pkg_size, reverse=False)[0]["url"]
     filename = pkg_url.split("/")[-1]
 
     # Select the appropriate parser from pkginfo based on the filename
@@ -356,7 +373,8 @@ def get_package_info(
                 version = pv[-1]
 
 
-            url = "https://pypi.org/pypi/{}/{}/json".format(package_name, version)
+            #url = "https://pypi.org/pypi/{}/{}/json".format(package_name, version)
+            url = "https://pypi.org/pypi/{}/json".format(package_name)
         else:
             url = "https://pypi.org/pypi/{}/json".format(package_name)
 
@@ -364,8 +382,9 @@ def get_package_info(
         info = json.loads(response)
 
         name = package_name
-        version = info["info"]["version"]
-        summary = info["info"]["summary"]
+        if not version:
+            version = info["info"]["version"]
+        summary = info["info"]["summary"].replace('\n', ' \\\n')
         homepage = info["info"]["home_page"]
         author = info["info"]["author"]
         author_email = info["info"]["author_email"]
@@ -460,25 +479,26 @@ def generate_recipe(package, outdir, python, is_extra=False, use_pypi=False):
             sha256=package.src_sha256,
             src_uri=package.src_uri,
             src_dir=package.src_dir,
-            pypi_package=package.name,
+            pypi_package=package.name.replace("-", "_"),
+            pypi_package_ext="\nPYPI_PACKAGE_EXT = \"" + get_file_extension(package.src_uri) + "\"" if not package.src_uri.endswith(".tar.gz") else "",
             license=package.license,
             license_file=package.license_file,
             license_md5=package.license_md5,
             homepage=package.homepage,
             author=package.author,
             author_email=package.author_email,
-            build_dependencies=" ".join(
+            build_dependencies="DEPENDS += \" " + " \\\n    ".join(
                 [
                     dep
                     for dep in package.build_dependencies
                 ]
-            ),
-            dependencies=" ".join(
+            ) + "\"",
+            dependencies="RDEPENDS_${{PN}} = \"" + " \\\n   ".join(
                 [
                     "{}-{}".format(python, package_to_bb_name(dep.name))
                     for dep in package.dependencies
                 ]
-            ),
+            ) + "\"",
             setuptools="3" if python == "python3" else "",
         )
 
@@ -575,7 +595,7 @@ def main():
             "--python",
             "-y",
             help="The python version to use.",
-            default="python",
+            default="python3",
             choices=["python", "python3"],
         )
         parser.add_argument(
